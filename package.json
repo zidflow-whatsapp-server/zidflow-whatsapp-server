@@ -1,7 +1,6 @@
 {
   "name": "zidflow-whatsapp-server",
   "version": "1.0.0",
-  "description": "ZidFlow WhatsApp Automation Server",
   "main": "server.js",
   "type": "commonjs",
   "scripts": {
@@ -10,9 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "qrcode": "^1.5.3",
-    "qrcode-terminal": "^0.12.0",
-    "@whiskeysockets/baileys": "^6.7.9",
-    "pino": "^8.15.0"
+    "pino": "^8.15.0",
+    "@whiskeysockets/baileys": "^6.7.9"
   },
   "engines": {
     "node": ">=18.0.0"
