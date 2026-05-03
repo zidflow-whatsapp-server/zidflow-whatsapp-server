@@ -1,213 +1,191 @@
 const express = require('express');
 const qrcode = require('qrcode');
+const path = require('path');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json());
 
-// ===== WHATSAPP CLIENT SETUP =====
-let client = null;
+// ===== STATE =====
+let sock = null;
 let qrCodeData = null;
-let clientStatus = 'DISCONNECTED'; // DISCONNECTED | CONNECTING | QR | READY
+let clientStatus = 'DISCONNECTED';
 let retryCount = 0;
-const MAX_RETRIES = 3;
 
+// ===== WHATSAPP INIT (Baileys - Lightweight, No Browser Needed) =====
 async function initWhatsApp() {
   try {
-    const { Client, LocalAuth } = require('whatsapp-web.js');
-    
-    console.log('[WhatsApp] Initializing client...');
+    const { default: makeWASocket, useMultiFileAuthState, DisconnectReason } = await import('@whiskeysockets/baileys');
+    const { Boom } = await import('@hapi/boom');
+    const pino = (await import('pino')).default;
+
+    const sessionDir = '/tmp/whatsapp-baileys-session';
+    if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
+
+    const { state, saveCreds } = await useMultiFileAuthState(sessionDir);
+
+    console.log('[WhatsApp] Initializing Baileys client...');
     clientStatus = 'CONNECTING';
-    
-    client = new Client({
-      authStrategy: new LocalAuth({ dataPath: '/tmp/whatsapp-session' }),
-      puppeteer: {
-        headless: true,
-        args: [
-          '--no-sandbox',
-          '--disable-setuid-sandbox',
-          '--disable-dev-shm-usage',
-          '--disable-accelerated-2d-canvas',
-          '--no-first-run',
-          '--no-zygote',
-          '--single-process',
-          '--disable-gpu'
-        ]
+
+    sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      logger: pino({ level: 'silent' }),
+      browser: ['ZidFlow', 'Chrome', '1.0.0'],
+      connectTimeoutMs: 60000,
+      defaultQueryTimeoutMs: 60000,
+    });
+
+    sock.ev.on('creds.update', saveCreds);
+
+    sock.ev.on('connection.update', async ({ connection, lastDisconnect, qr }) => {
+      if (qr) {
+        console.log('[WhatsApp] QR Code ready - scan it!');
+        clientStatus = 'QR';
+        qrCodeData = await qrcode.toDataURL(qr);
+      }
+
+      if (connection === 'open') {
+        console.log('[WhatsApp] ✅ Connected successfully!');
+        clientStatus = 'READY';
+        qrCodeData = null;
+        retryCount = 0;
+      }
+
+      if (connection === 'close') {
+        const { StatusCode } = await import('@whiskeysockets/baileys');
+        const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
+        console.log('[WhatsApp] Connection closed. Reconnect:', shouldReconnect);
+        clientStatus = 'DISCONNECTED';
+        qrCodeData = null;
+
+        if (shouldReconnect && retryCount < 5) {
+          retryCount++;
+          console.log(`[WhatsApp] Reconnecting in 5s... (${retryCount}/5)`);
+          setTimeout(initWhatsApp, 5000);
+        } else if (!shouldReconnect) {
+          // Logged out - clear session
+          fs.rmSync(sessionDir, { recursive: true, force: true });
+          console.log('[WhatsApp] Logged out. Session cleared. Restart to get new QR.');
+        }
       }
     });
-
-    client.on('qr', async (qr) => {
-      console.log('[WhatsApp] QR Code received. Scan it!');
-      clientStatus = 'QR';
-      qrCodeData = await qrcode.toDataURL(qr);
-    });
-
-    client.on('ready', () => {
-      console.log('[WhatsApp] ✅ Client is READY!');
-      clientStatus = 'READY';
-      qrCodeData = null;
-      retryCount = 0;
-    });
-
-    client.on('authenticated', () => {
-      console.log('[WhatsApp] Authenticated successfully.');
-    });
-
-    client.on('auth_failure', (msg) => {
-      console.error('[WhatsApp] Auth failure:', msg);
-      clientStatus = 'DISCONNECTED';
-    });
-
-    client.on('disconnected', (reason) => {
-      console.warn('[WhatsApp] Disconnected:', reason);
-      clientStatus = 'DISCONNECTED';
-      qrCodeData = null;
-      
-      // Auto-reconnect after 10 seconds
-      if (retryCount < MAX_RETRIES) {
-        retryCount++;
-        console.log(`[WhatsApp] Reconnecting... (attempt ${retryCount}/${MAX_RETRIES})`);
-        setTimeout(initWhatsApp, 10000);
-      }
-    });
-
-    await client.initialize();
 
   } catch (err) {
     console.error('[WhatsApp] Init error:', err.message);
     clientStatus = 'DISCONNECTED';
+    if (retryCount < 3) {
+      retryCount++;
+      setTimeout(initWhatsApp, 10000);
+    }
   }
 }
 
-// Start WhatsApp on boot
+// Start on boot
 initWhatsApp();
 
+// ===== ROUTES =====
 
-// ===== API ROUTES =====
-
-// Health check + status
+// Status
 app.get('/', (req, res) => {
   res.json({
     service: 'ZidFlow WhatsApp Server',
     status: clientStatus,
     ready: clientStatus === 'READY',
-    hasQR: !!qrCodeData
+    hasQR: !!qrCodeData,
+    qrPage: '/qr'
   });
 });
 
-// Get QR Code (open this URL in browser to scan)
+// QR Code page
 app.get('/qr', (req, res) => {
   if (clientStatus === 'READY') {
     return res.send(`
-      <html><body style="text-align:center;font-family:Arial;padding:40px;background:#f0f9f0">
-        <h1 style="color:#004d40">✅ WhatsApp متصل!</h1>
-        <p>الخادم يعمل بشكل طبيعي</p>
+      <html><body style="font-family:Arial;text-align:center;padding:60px;background:#f0fff4">
+        <div style="font-size:80px">✅</div>
+        <h1 style="color:#004d40">واتساب متصل!</h1>
+        <p style="color:#555">النظام يعمل بشكل طبيعي. الرسائل ترسل تلقائياً.</p>
+        <div style="background:#e8f5e9;padding:20px;border-radius:12px;display:inline-block;margin-top:20px">
+          <code style="color:#1b5e20">Status: READY ✅</code>
+        </div>
       </body></html>
     `);
   }
+
   if (!qrCodeData) {
     return res.send(`
-      <html><body style="text-align:center;font-family:Arial;padding:40px">
-        <h2>⏳ جاري تحميل الـ QR...</h2>
-        <p>انتظر 30 ثانية ثم أعد تحديث الصفحة</p>
-        <meta http-equiv="refresh" content="5">
+      <html>
+      <head><meta http-equiv="refresh" content="5"><title>ZidFlow WA - Loading</title></head>
+      <body style="font-family:Arial;text-align:center;padding:60px;background:#fafafa">
+        <div style="font-size:60px">⏳</div>
+        <h2>جاري تجهيز QR Code...</h2>
+        <p style="color:#666">الحالة: <strong>${clientStatus}</strong></p>
+        <p style="color:#999;font-size:13px">الصفحة تتحدث كل 5 ثوانٍ تلقائياً</p>
+        <div style="width:40px;height:40px;border:4px solid #004d40;border-top:4px solid transparent;border-radius:50%;animation:spin 1s linear infinite;margin:20px auto"></div>
+        <style>@keyframes spin{to{transform:rotate(360deg)}}</style>
       </body></html>
     `);
   }
+
   res.send(`
     <html>
-    <head><title>ZidFlow WhatsApp QR</title></head>
-    <body style="text-align:center;font-family:Arial;padding:40px;background:#fafafa">
-      <h1 style="color:#004d40">📱 امسح QR Code</h1>
-      <p style="color:#666">افتح واتساب → النقاط الثلاث → WhatsApp Web → امسح الكود</p>
-      <img src="${qrCodeData}" style="width:300px;border:2px solid #004d40;border-radius:12px;padding:10px;background:white"/>
-      <p style="color:#888;font-size:12px">الصفحة تتحدث تلقائياً كل 10 ثوانٍ</p>
-      <meta http-equiv="refresh" content="10">
-    </body>
-    </html>
+    <head><meta http-equiv="refresh" content="30"><title>ZidFlow - امسح QR</title></head>
+    <body style="font-family:Arial;text-align:center;padding:40px;background:#fafafa" dir="rtl">
+      <h1 style="color:#004d40">📱 امسح QR Code الآن</h1>
+      <p style="color:#555;margin-bottom:30px">
+        افتح واتساب → اضغط النقاط الثلاث ⋮ → <strong>WhatsApp Web</strong> → امسح
+      </p>
+      <div style="background:white;display:inline-block;padding:20px;border-radius:16px;border:3px solid #004d40;box-shadow:0 8px 32px rgba(0,77,64,0.15)">
+        <img src="${qrCodeData}" style="width:280px;display:block"/>
+      </div>
+      <p style="color:#999;margin-top:20px;font-size:13px">⏱️ الصفحة تتحدث كل 30 ثانية</p>
+    </body></html>
   `);
 });
 
-// Send WhatsApp message (called by ZidFlow on new order)
+// Send message
 app.post('/send', async (req, res) => {
   const { to, message, secret } = req.body;
 
-  // Basic security check
   if (process.env.API_SECRET && secret !== process.env.API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-
   if (!to || !message) {
     return res.status(400).json({ error: 'to and message are required' });
   }
-
-  if (clientStatus !== 'READY') {
-    return res.status(503).json({ 
-      error: 'WhatsApp not ready', 
-      status: clientStatus,
-      qrUrl: clientStatus === 'QR' ? '/qr' : null
-    });
+  if (clientStatus !== 'READY' || !sock) {
+    return res.status(503).json({ error: 'WhatsApp not ready', status: clientStatus });
   }
 
   try {
-    const formattedNumber = to.replace(/\D/g, '') + '@c.us';
-    await client.sendMessage(formattedNumber, message);
-    console.log(`[WhatsApp] ✅ Message sent to ${to}`);
-    res.json({ success: true, to, message });
+    const jid = to.replace(/\D/g, '') + '@s.whatsapp.net';
+    await sock.sendMessage(jid, { text: message });
+    console.log(`[WA] ✅ Sent to ${to}`);
+    res.json({ success: true });
   } catch (err) {
-    console.error('[WhatsApp] Send error:', err.message);
+    console.error('[WA] Send error:', err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Send to multiple numbers at once
-app.post('/send-bulk', async (req, res) => {
-  const { messages, secret } = req.body;
-  
-  if (process.env.API_SECRET && secret !== process.env.API_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-
-  if (clientStatus !== 'READY') {
-    return res.status(503).json({ error: 'WhatsApp not ready', status: clientStatus });
-  }
-
-  const results = [];
-  for (const { to, message } of messages) {
-    try {
-      const formattedNumber = to.replace(/\D/g, '') + '@c.us';
-      await client.sendMessage(formattedNumber, message);
-      results.push({ to, success: true });
-      // Small delay between messages to avoid spam detection
-      await new Promise(r => setTimeout(r, 1500));
-    } catch (err) {
-      results.push({ to, success: false, error: err.message });
-    }
-  }
-
-  res.json({ results });
-});
-
-// Restart WhatsApp client
+// Restart
 app.post('/restart', async (req, res) => {
   const { secret } = req.body;
   if (process.env.API_SECRET && secret !== process.env.API_SECRET) {
     return res.status(401).json({ error: 'Unauthorized' });
   }
-  
-  if (client) {
-    try { await client.destroy(); } catch (e) {}
-  }
+  try {
+    if (sock) await sock.logout().catch(() => {});
+  } catch (e) {}
   clientStatus = 'DISCONNECTED';
   retryCount = 0;
-  
   setTimeout(initWhatsApp, 2000);
-  res.json({ success: true, message: 'Restarting WhatsApp client...' });
+  res.json({ success: true, message: 'Restarting...' });
 });
 
-
-// ===== START SERVER =====
+// Start server
 const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-  console.log(`\n🟢 ZidFlow WhatsApp Server running on port ${PORT}`);
-  console.log(`📱 Open /qr to scan WhatsApp QR Code\n`);
+  console.log(`\n🟢 ZidFlow WhatsApp Server on port ${PORT}`);
+  console.log(`📱 Scan QR at /qr\n`);
 });
